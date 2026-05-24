@@ -46,6 +46,9 @@ evaluator/
 PLAN.md
 .claude/
 
+# Article source (separate submission)
+article/
+
 # LaTeX build artifacts
 article/*.aux
 article/*.log
