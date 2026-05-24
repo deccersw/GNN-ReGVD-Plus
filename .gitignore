@@ -1,0 +1,58 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Model weights and indices
+*.bin
+*.pt
+*.pth
+*.onnx
+code/saved_models/
+code/training_log.txt
+code/predictions_hybrid.json
+code/add_to_faiss.json
+
+# Large data files
+dataset/function.json
+dataset/*.txt
+
+# Joern binary (2GB+)
+joern/joern-cli/
+
+# Intermediate / generated
+workspace/
+evaluator/
+.pytest_cache/
+
+# Internal planning
+PLAN.md
+.claude/
+
+# LaTeX build artifacts
+article/*.aux
+article/*.log
+article/*.out
+article/*.bbl
+article/*.blg
+article/*.fls
+article/*.fdb_latexmk
+article/*.synctex.gz
+article/*.toc

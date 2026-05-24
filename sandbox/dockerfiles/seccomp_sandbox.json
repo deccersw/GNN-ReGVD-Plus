@@ -1,0 +1,58 @@
+{
+  "defaultAction": "SCMP_ACT_ERRNO",
+  "defaultErrnoRet": 1,
+  "archMap": [
+    { "architecture": "SCMP_ARCH_X86_64", "subArchitectures": ["SCMP_ARCH_X86", "SCMP_ARCH_X32"] },
+    { "architecture": "SCMP_ARCH_AARCH64", "subArchitectures": ["SCMP_ARCH_ARM"] }
+  ],
+  "syscalls": [
+    {
+      "names": [
+        "read", "write", "open", "openat", "close", "stat", "fstat", "lstat",
+        "poll", "lseek", "mmap", "mprotect", "munmap", "brk",
+        "rt_sigaction", "rt_sigprocmask", "rt_sigreturn",
+        "ioctl", "access", "pipe", "pipe2",
+        "select", "pselect6", "sched_yield",
+        "mremap", "msync", "madvise",
+        "dup", "dup2", "dup3",
+        "nanosleep", "clock_nanosleep",
+        "getpid", "getppid", "getuid", "geteuid", "getgid", "getegid",
+        "uname", "fcntl",
+        "flock", "fsync", "fdatasync", "ftruncate",
+        "getcwd", "chdir",
+        "readlink", "readlinkat",
+        "chmod", "fchmod", "fchmodat",
+        "umask",
+        "gettimeofday", "clock_gettime", "clock_getres",
+        "getrlimit", "prlimit64",
+        "set_tid_address", "set_robust_list",
+        "futex",
+        "sched_getaffinity",
+        "exit", "exit_group",
+        "wait4", "waitid",
+        "clone", "fork", "vfork", "execve",
+        "arch_prctl", "prctl",
+        "mlock", "munlock",
+        "getrandom",
+        "memfd_create",
+        "newfstatat",
+        "rseq",
+        "pread64", "pwrite64",
+        "writev", "readv",
+        "faccessat", "faccessat2",
+        "statx",
+        "close_range",
+        "sigaltstack",
+        "tgkill",
+        "getdents64",
+        "unlink", "unlinkat",
+        "rename", "renameat", "renameat2",
+        "mkdir", "mkdirat",
+        "rmdir",
+        "link", "linkat",
+        "symlink", "symlinkat"
+      ],
+      "action": "SCMP_ACT_ALLOW"
+    }
+  ]
+}
