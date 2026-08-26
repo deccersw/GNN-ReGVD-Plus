@@ -471,9 +471,14 @@ def train(args, train_dataset, model, tokenizer):
 
                         metric_name = args.early_stopping_metric
                         current = results[metric_name]
-                        # eval_loss improves downwards, the rest upwards
-                        improved = (current < best_metric) if metric_name == 'eval_loss' \
-                            else (current > best_metric)
+                        # An improvement must clear min_delta, otherwise noise
+                        # in the fourth decimal keeps resetting the patience
+                        # counter and the run never stops: eval_auc going
+                        # 0.7139 -> 0.7143 is not progress.
+                        delta = args.early_stopping_min_delta
+                        improved = (current < best_metric - delta) \
+                            if metric_name == 'eval_loss' \
+                            else (current > best_metric + delta)
 
                         if improved:
                             best_metric = current
@@ -820,6 +825,10 @@ def main():
     parser.add_argument("--early_stopping_patience", type=int, default=0,
                         help="Stop after N evaluations with no improvement "
                              "(0 = disabled). The best checkpoint is kept.")
+    parser.add_argument("--early_stopping_min_delta", type=float, default=0.001,
+                        help="Smallest change in the watched metric that counts "
+                             "as an improvement. Without it, noise in the last "
+                             "decimals keeps resetting the patience counter.")
     parser.add_argument("--early_stopping_metric", type=str, default="eval_loss",
                         choices=["eval_loss", "eval_acc", "eval_auc", "eval_f1"],
                         help="Metric early stopping watches (default: eval_loss, "
