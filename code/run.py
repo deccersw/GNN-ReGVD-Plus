@@ -701,9 +701,26 @@ def test(args, model, tokenizer):
 
     logits = np.concatenate(logits, 0)
     labels = np.concatenate(labels, 0)
-    preds = logits[:, 0] > 0.5
+    probs = logits[:, 0]
+    preds = probs > 0.5
 
+    # Accuracy alone is not enough to report: on a 46/54 split it hides both
+    # a degenerate all-negative classifier and a change in the ranking
+    # quality. Mirror the metric set evaluate() already computes.
     test_acc = np.mean(labels == preds)
+    try:
+        test_auc = roc_auc_score(labels, probs)
+    except ValueError:
+        test_auc = 0.0
+    test_metrics = {
+        "test_acc": round(float(test_acc), 4),
+        "test_auc": round(float(test_auc), 4),
+        "test_f1": round(float(f1_score(labels, preds, zero_division=0)), 4),
+        "test_precision": round(
+            float(precision_score(labels, preds, zero_division=0)), 4),
+        "test_recall": round(
+            float(recall_score(labels, preds, zero_division=0)), 4),
+    }
     with open(os.path.join(args.output_dir, "predictions.txt"), 'w') as f:
         for example, pred in zip(eval_dataset.examples, preds):
             if pred:
@@ -711,10 +728,7 @@ def test(args, model, tokenizer):
             else:
                 f.write(example.idx + '\t0\n')
 
-    result = {
-        "test_acc": round(test_acc, 4),
-    }
-    return result
+    return test_metrics
 
 
 def load_best_checkpoint(args, model):
