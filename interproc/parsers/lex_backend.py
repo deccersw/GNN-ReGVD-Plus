@@ -383,6 +383,18 @@ class LexerBackend:
                 stmt_start = i
 
             if c == '{':
+                head = " ".join(text[stmt_start:i].split()) \
+                    if stmt_start is not None else ""
+                if _is_transparent_block(head):
+                    # `extern "C" { ... }` and `namespace X { ... }` do not
+                    # introduce a scope for declarations -- everything inside
+                    # is still top level. Skipping the block wholesale lost
+                    # every prototype in a C header with the C++ guard, which
+                    # is nearly all of them: tiffio.h yielded 1 prototype
+                    # instead of ~200.
+                    i += 1
+                    stmt_start = None
+                    continue
                 close = clex.match_pair(text, mask, i, '{', '}')
                 if close < 0:
                     break
@@ -435,6 +447,16 @@ class LexerBackend:
 # ----------------------------------------------------------------------
 # Small helpers shared with the tree-sitter backend
 # ----------------------------------------------------------------------
+
+def _is_transparent_block(head: str) -> bool:
+    """Does this `{` open a linkage/namespace block rather than a type body?"""
+    if not head:
+        return False
+    if head.startswith('extern "C"') or head.startswith('extern "C++"'):
+        return True
+    first = head.split(None, 1)[0] if head.split() else ""
+    return first == "namespace"
+
 
 def _last_identifier(text: str) -> str:
     mask = clex.code_mask(text)
