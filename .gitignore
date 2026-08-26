@@ -37,6 +37,13 @@ dataset/*.txt
 # Joern binary (2GB+)
 joern/joern-cli/
 
+# Training logs
+*.log
+!article/*.log
+
+# Module 0 parse cache
+.interproc_cache/
+
 # Intermediate / generated
 workspace/
 evaluator/

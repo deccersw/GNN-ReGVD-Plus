@@ -25,6 +25,12 @@ class ScannerConfig:
     use_lora: bool = True
     lora_rank: int = 8
     lora_alpha: int = 16
+    # How node features are produced. Must match the value used at training
+    # time, otherwise the checkpoint is being run under a different model.
+    #   static     — frozen embedding-table lookup; the transformer never runs
+    #   contextual — encoder runs, LoRA adapters are active
+    #   auto       — contextual iff use_lora
+    encoder_mode: str = "auto"
     use_faiss: bool = True
     embed_dim: int = 512
     num_classes: int = 2
@@ -76,6 +82,18 @@ class ScannerConfig:
     early_stop_on_confirmed: bool = True
     language: str = "c"
     use_multi_harness: bool = True
+
+    # Module 0: interprocedural inlining (project-level scanning)
+    # inline_max_depth is the depth hyperparameter: 0 keeps the current
+    # single-function behaviour, 1 inlines direct callees, 2 also theirs.
+    use_inlining: bool = False
+    inline_max_depth: int = 2
+    inline_strategy: str = "priority"      # priority | dfs | bfs
+    inline_max_callee_tokens: int = 200
+    inline_max_expansions_per_callee: int = 2
+    inline_parser_backend: str = "auto"    # auto | treesitter | lexer
+    inline_debug_markers: bool = False
+    inline_max_roots: int = 0              # 0 = every function in the project
 
     # Dry-run mode (skips sandbox + triage API, uses stubs)
     dry_run: bool = False

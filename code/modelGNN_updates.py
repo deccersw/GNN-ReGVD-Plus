@@ -1,4 +1,5 @@
 import math
+import numpy as np
 import torch
 import torch.nn as nn
 from torch.nn.parameter import Parameter
@@ -201,77 +202,147 @@ print('using default unweighted graph')
 
 
 # build graph function
+def _uni_graph(doc_words, window_size=3):
+    """Build the co-occurrence adjacency for one token sequence.
+
+    Shared by build_graph() and build_graph_index() so that the static and the
+    contextual feature paths are guaranteed to produce *identical* graph
+    structure -- only the node features differ between them.
+
+    Returns (adj, doc_word_id_map) where the map sends a token id to its node.
+    """
+    doc_len = len(doc_words)
+    doc_vocab = list(set(doc_words))
+    doc_nodes = len(doc_vocab)
+
+    doc_word_id_map = {}
+    for j in range(doc_nodes):
+        doc_word_id_map[doc_vocab[j]] = j
+
+    # sliding windows
+    windows = []
+    if doc_len <= window_size:
+        windows.append(doc_words)
+    else:
+        for j in range(doc_len - window_size + 1):
+            windows.append(doc_words[j: j + window_size])
+
+    word_pair_count = {}
+    for window in windows:
+        for p in range(1, len(window)):
+            for q in range(0, p):
+                word_p_id = window[p]
+                word_q_id = window[q]
+                if word_p_id == word_q_id:
+                    continue
+                word_pair_key = (word_p_id, word_q_id)
+                # word co-occurrences as weights
+                if word_pair_key in word_pair_count:
+                    word_pair_count[word_pair_key] += 1.
+                else:
+                    word_pair_count[word_pair_key] = 1.
+                # bi-direction
+                word_pair_key = (word_q_id, word_p_id)
+                if word_pair_key in word_pair_count:
+                    word_pair_count[word_pair_key] += 1.
+                else:
+                    word_pair_count[word_pair_key] = 1.
+
+    row = []
+    col = []
+    weight = []
+    for key in word_pair_count:
+        row.append(doc_word_id_map[key[0]])
+        col.append(doc_word_id_map[key[1]])
+        weight.append(word_pair_count[key] if weighted_graph else 1.)
+
+    adj = sp.csr_matrix((weight, (row, col)), shape=(doc_nodes, doc_nodes))
+    return adj, doc_word_id_map
+
+
 def build_graph(shuffle_doc_words_list, word_embeddings, window_size=3):
-    # print('using window size = ', window_size)
+    """Graph with *static* node features taken from the embedding table."""
     x_adj = []
     x_feature = []
-    y = []
-    doc_len_list = []
-    vocab_set = set()
 
     for i in range(len(shuffle_doc_words_list)):
         doc_words = shuffle_doc_words_list[i]
-        doc_len = len(doc_words)
-
-        doc_vocab = list(set(doc_words))
-        doc_nodes = len(doc_vocab)
-
-        doc_len_list.append(doc_nodes)
-        vocab_set.update(doc_vocab)
-
-        doc_word_id_map = {}
-        for j in range(doc_nodes):
-            doc_word_id_map[doc_vocab[j]] = j
-
-        # sliding windows
-        windows = []
-        if doc_len <= window_size:
-            windows.append(doc_words)
-        else:
-            for j in range(doc_len - window_size + 1):
-                window = doc_words[j: j + window_size]
-                windows.append(window)
-
-        word_pair_count = {}
-        for window in windows:
-            for p in range(1, len(window)):
-                for q in range(0, p):
-                    word_p_id = window[p]
-                    word_q_id = window[q]
-                    if word_p_id == word_q_id:
-                        continue
-                    word_pair_key = (word_p_id, word_q_id)
-                    # word co-occurrences as weights
-                    if word_pair_key in word_pair_count:
-                        word_pair_count[word_pair_key] += 1.
-                    else:
-                        word_pair_count[word_pair_key] = 1.
-                    # bi-direction
-                    word_pair_key = (word_q_id, word_p_id)
-                    if word_pair_key in word_pair_count:
-                        word_pair_count[word_pair_key] += 1.
-                    else:
-                        word_pair_count[word_pair_key] = 1.
-
-        row = []
-        col = []
-        weight = []
-        features = []
-
-        for key in word_pair_count:
-            p = key[0]
-            q = key[1]
-            row.append(doc_word_id_map[p])
-            col.append(doc_word_id_map[q])
-            weight.append(word_pair_count[key] if weighted_graph else 1.)
-        adj = sp.csr_matrix((weight, (row, col)), shape=(doc_nodes, doc_nodes))
+        adj, doc_word_id_map = _uni_graph(doc_words, window_size)
         x_adj.append(adj)
 
+        features = []
         for k, v in sorted(doc_word_id_map.items(), key=lambda x: x[1]):
             features.append(word_embeddings[k])
         x_feature.append(features)
 
     return x_adj, x_feature
+
+
+def build_graph_index(shuffle_doc_words_list, window_size=3):
+    """Same adjacency as build_graph(), but returns node indices per position.
+
+    Node features are *not* materialised here: the caller gathers them from
+    the encoder's contextual hidden states in torch, which is what keeps the
+    encoder (and therefore the LoRA adapters) in the autograd graph.
+
+    Returns (x_adj, node_ids) where node_ids[i][p] is the graph node that
+    token position p of sample i belongs to.
+    """
+    x_adj = []
+    node_ids = []
+
+    for i in range(len(shuffle_doc_words_list)):
+        doc_words = shuffle_doc_words_list[i]
+        adj, doc_word_id_map = _uni_graph(doc_words, window_size)
+        x_adj.append(adj)
+        node_ids.append(
+            np.array([doc_word_id_map[w] for w in doc_words], dtype=np.int64)
+        )
+
+    return x_adj, node_ids
+
+
+def _text_graph(doc_len, window_size=3):
+    """Positional adjacency for one sequence: node i is token position i."""
+    row = []
+    col = []
+    weight = []
+
+    if doc_len > window_size:
+        for j in range(doc_len - window_size + 1):
+            for p in range(j + 1, j + window_size):
+                for q in range(j, p):
+                    row.append(p)
+                    col.append(q)
+                    weight.append(1.)
+                    #
+                    row.append(q)
+                    col.append(p)
+                    weight.append(1.)
+    else:  # doc_len < window_size
+        for p in range(1, doc_len):
+            for q in range(0, p):
+                row.append(p)
+                col.append(q)
+                weight.append(1.)
+                #
+                row.append(q)
+                col.append(p)
+                weight.append(1.)
+
+    adj = sp.csr_matrix((weight, (row, col)), shape=(doc_len, doc_len))
+    if weighted_graph == False:
+        adj[adj > 1] = 1.
+    return adj
+
+
+def build_graph_text_index(shuffle_doc_words_list, window_size=3):
+    """Positional variant: node i is token position i, so the mapping is identity."""
+    x_adj = [_text_graph(len(doc), window_size)
+             for doc in shuffle_doc_words_list]
+    node_ids = [np.arange(len(doc), dtype=np.int64)
+                for doc in shuffle_doc_words_list]
+    return x_adj, node_ids
 
 
 # another way to build graph from text

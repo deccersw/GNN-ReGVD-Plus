@@ -34,9 +34,42 @@ def parse_args():
                              help="Path to source file to scan")
     input_group.add_argument("--jsonl", type=str,
                              help="Path to JSONL dataset for batch scanning")
+    input_group.add_argument("--project", type=str,
+                             help="Path to a C/C++ project directory "
+                                  "(Module 0 splits it into analysis units)")
 
     p.add_argument("--sandbox-only", action="store_true",
                    help="Run sandbox verification only (skip GNN)")
+
+    # --- Module 0: interprocedural inlining -------------------------------
+    g = p.add_argument_group("Module 0: interprocedural inlining")
+    g.add_argument("--build-units-only", action="store_true",
+                   help="Only split the project into inlined analysis units "
+                        "and stop: no GNN, no LLM, no sandbox. Use with "
+                        "--project to inspect the split on its own.")
+    g.add_argument("--inline-depth", type=int, default=2,
+                   help="How deep to inline callees into each function: "
+                        "0 = no inlining (current single-function behaviour), "
+                        "1 = direct callees, 2 = also their callees "
+                        "(default: 2)")
+    g.add_argument("--inline-strategy", type=str, default="priority",
+                   choices=["priority", "dfs", "bfs"],
+                   help="Order in which call sites spend the token budget "
+                        "(default: priority — sinks and tainted arguments first)")
+    g.add_argument("--inline-max-callee-tokens", type=int, default=200,
+                   help="Largest callee that may be inlined (default: 200)")
+    g.add_argument("--inline-parser", type=str, default="auto",
+                   choices=["auto", "treesitter", "lexer"],
+                   help="Parser backend for Module 0 (default: auto)")
+    g.add_argument("--inline-markers", action="store_true",
+                   help="Emit /* inline f */ comments in the GNN view (debug; "
+                        "they cost tokens from the detector's window)")
+    g.add_argument("--max-functions", type=int, default=0,
+                   help="Analyse at most N functions of the project (0 = all)")
+    g.add_argument("--units-out", type=str, default=None,
+                   help="Write the analysis units to this JSONL file")
+    g.add_argument("--units-stats", type=str, default=None,
+                   help="Write Module 0 build statistics to this JSON file")
 
     p.add_argument("--model-path", type=str, default="",
                    help="Path to trained GNN model checkpoint")
@@ -120,7 +153,136 @@ def build_config(args) -> ScannerConfig:
         triage_model=getattr(args, "triage_model",
                              "openrouter/anthropic/claude-sonnet-4-6"),
         dry_run=getattr(args, "dry_run", False),
+        use_inlining=bool(getattr(args, "project", None)),
+        inline_max_depth=getattr(args, "inline_depth", 2),
+        inline_strategy=getattr(args, "inline_strategy", "priority"),
+        inline_max_callee_tokens=getattr(args, "inline_max_callee_tokens", 200),
+        inline_parser_backend=getattr(args, "inline_parser", "auto"),
+        inline_debug_markers=getattr(args, "inline_markers", False),
+        inline_max_roots=getattr(args, "max_functions", 0),
     )
+
+
+def build_units(args, config):
+    """Run Module 0 over a project directory and return (units, pipeline)."""
+    from interproc import InliningConfig, InterprocPipeline
+
+    logger = logging.getLogger(__name__)
+    inline_config = InliningConfig.from_scanner_config(config)
+    logger.info(
+        "[Module 0] Building analysis units: project=%s, depth=%d, "
+        "strategy=%s, budget=%d tokens, parser=%s",
+        args.project, inline_config.max_depth, inline_config.strategy,
+        inline_config.max_tokens, inline_config.parser_backend,
+    )
+
+    pipeline = InterprocPipeline(inline_config)
+    pipeline.analyze(args.project)
+    if not pipeline.index.functions:
+        raise SystemExit(
+            f"Error: no C/C++ functions found in {args.project}")
+
+    units = pipeline.build(args.project)
+    logger.info(
+        "[Module 0] %d units built from %d functions "
+        "(inlining applied in %d, truncated %d, avg growth x%.2f)",
+        len(units), pipeline.stats.functions_found,
+        pipeline.stats.units_with_inlining, pipeline.stats.units_truncated,
+        pipeline.stats.avg_growth,
+    )
+    return units, pipeline
+
+
+def build_units_only_mode(args):
+    """--build-units-only: split the project and stop before the scanner."""
+    from interproc.cli import _summary
+    from interproc.units import write_units_jsonl
+
+    config = build_config(args)
+    units, pipeline = build_units(args, config)
+
+    if args.units_out:
+        write_units_jsonl(units, args.units_out)
+        print(f"\n{len(units)} units written to {args.units_out}")
+
+    stats = pipeline.stats.to_dict()
+    if args.units_stats:
+        with open(args.units_stats, "w") as f:
+            json.dump(stats, f, indent=2)
+        print(f"Statistics written to {args.units_stats}")
+
+    if args.json:
+        print(json.dumps({
+            "stats": stats,
+            "units": [u.to_jsonl_record(i) for i, u in enumerate(units)],
+        }, indent=2, ensure_ascii=False))
+        return units
+
+    print(_summary(stats, len(units)))
+
+    ranked = sorted(units, key=lambda u: -len(u.inlined))[:10]
+    if ranked and ranked[0].inlined:
+        print("\nUnits with the most inlined context:")
+        for unit in ranked:
+            if not unit.inlined:
+                break
+            callees = ", ".join(r.callee_name for r in unit.inlined[:4])
+            print(f"  {str(unit.root):<48} {len(unit.inlined)} inlined "
+                  f"({callees}) -> {unit.tokens_gnn} tok"
+                  f"{'  [TRUNCATED]' if unit.truncated else ''}")
+
+    if args.verbose:
+        for unit in units:
+            print(f"\n--- {unit.root} ---")
+            print(unit.code_for_gnn)
+
+    return units
+
+
+def scan_project(scanner, args, config):
+    """Scan every unit of a project through the existing pipeline."""
+    units, pipeline = build_units(args, config)
+    results = []
+
+    for i, unit in enumerate(units):
+        print(f"\n--- Unit {i+1}/{len(units)}: {unit.root} "
+              f"({len(unit.inlined)} inlined, {unit.tokens_gnn} tok) ---")
+        result = scanner.scan(unit.code_for_gnn)
+        result.unit_id = unit.unit_id
+        result.file = unit.root.file
+        result.function = unit.root.name
+        result.start_line = unit.root.start_line
+        result.end_line = unit.root.start_line
+        result.inline_depth_used = unit.depth_used
+        result.inlined_functions = [r.callee_name for r in unit.inlined]
+        result.provenance_files = unit.provenance_files
+        result.inline_truncated = unit.truncated
+
+        if args.json:
+            print(to_json(result))
+        else:
+            print(format_report(result, verbose=args.verbose))
+        results.append(result)
+
+    print("\n" + batch_summary(results))
+    flagged = [r for r in results if r.verdict in ("CONFIRMED", "SUGGESTIVE")]
+    if flagged:
+        print("\nFlagged units:")
+        for r in sorted(flagged, key=lambda r: -r.confidence):
+            extra = f" via {', '.join(r.inlined_functions)}" \
+                if r.inlined_functions else ""
+            print(f"  [{r.verdict}] {r.file}:{r.function}:{r.start_line} "
+                  f"({r.confidence:.0%}){extra}")
+        print("\nNote: findings are reported per unit. Cross-unit "
+              "deduplication is not implemented yet, so a vulnerability in a "
+              "callee may appear both on its own and inside its callers.")
+
+    if args.output:
+        with open(args.output, "w") as f:
+            json.dump([json.loads(to_json(r)) for r in results], f, indent=2)
+        print(f"\nResults saved to {args.output}")
+
+    return results
 
 
 def scan_single(scanner, code: str, args):
@@ -379,10 +541,14 @@ def sandbox_only_mode(args):
 def main():
     args = parse_args()
 
-    if not any([args.code, args.file, args.jsonl,
+    if not any([args.code, args.file, args.jsonl, args.project,
                 args.sandbox_only, args.triage_only]):
-        print("Error: one of --code, --file, --jsonl, "
+        print("Error: one of --code, --file, --jsonl, --project, "
               "--sandbox-only, or --triage-only is required")
+        sys.exit(1)
+
+    if args.build_units_only and not args.project:
+        print("Error: --build-units-only requires --project")
         sys.exit(1)
 
     level = logging.DEBUG if args.verbose else logging.INFO
@@ -396,6 +562,10 @@ def main():
 
     # Log active modes
     modes = []
+    if args.build_units_only:
+        modes.append("build-units-only")
+    if args.project:
+        modes.append(f"project(depth={args.inline_depth})")
     if args.sandbox_only:
         modes.append("sandbox-only")
     if getattr(args, "triage_only", False):
@@ -413,12 +583,17 @@ def main():
     if getattr(args, "use_valgrind", False):
         modes.append("valgrind")
 
-    source = args.code and "<inline>" or args.file or args.jsonl or "N/A"
+    source = (args.code and "<inline>") or args.file or args.jsonl \
+        or args.project or "N/A"
     logger.info(
         "[CLI] GNN-ReGVD scanner: source=%s, modes=[%s], verbose=%s",
         source, ", ".join(modes) if modes else "full-pipeline",
         args.verbose,
     )
+
+    if args.build_units_only:
+        build_units_only_mode(args)
+        return
 
     if args.sandbox_only:
         sandbox_only_mode(args)
@@ -443,6 +618,8 @@ def main():
         scan_file(scanner, args.file, args)
     elif args.jsonl:
         scan_jsonl(scanner, args.jsonl, args)
+    elif args.project:
+        scan_project(scanner, args, config)
 
 
 if __name__ == "__main__":

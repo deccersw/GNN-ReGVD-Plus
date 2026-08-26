@@ -4,6 +4,11 @@
 # Extended with LoRA adapters and FAISS embedding head
 # for hybrid vulnerability detection pipeline.
 
+import logging
+import os
+
+import numpy as np
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -13,6 +18,304 @@ from torch.nn import CrossEntropyLoss, MSELoss
 from modelGNN_updates import *
 from utils import preprocess_features, preprocess_adj
 from utils import *
+
+logger = logging.getLogger(__name__)
+
+
+def _to_device(array, device):
+    """numpy -> float32 torch tensor on `device`.
+
+    The cast to float32 must happen *before* the transfer: the graph helpers
+    return float64 (numpy's default) and Apple MPS refuses float64 outright.
+    """
+    return torch.from_numpy(np.ascontiguousarray(array)).float().to(device)
+
+
+def pool_positions_to_nodes(hidden, node_ids, n_nodes):
+    """Mean-pool contextual token states onto graph nodes.
+
+    Args:
+        hidden:   (B, L, D) encoder hidden states -- differentiable
+        node_ids: list of B arrays of length L, node index per token position
+        n_nodes:  padded node count for the batch (from preprocess_adj)
+
+    Returns:
+        (B, n_nodes, D) node features, still attached to the autograd graph.
+
+    In "uni" format several positions share a node (one node per distinct
+    token), so their states are averaged; in "text" format the mapping is
+    one-to-one and this reduces to a permutation.
+    """
+    batch, length, dim = hidden.shape
+    device = hidden.device
+
+    index = torch.zeros(batch, length, dtype=torch.long, device=device)
+    for b, ids in enumerate(node_ids):
+        index[b, :len(ids)] = torch.as_tensor(ids, dtype=torch.long,
+                                              device=device)
+
+    sums = hidden.new_zeros(batch, n_nodes, dim)
+    counts = hidden.new_zeros(batch, n_nodes, 1)
+    sums.scatter_add_(1, index.unsqueeze(-1).expand(batch, length, dim), hidden)
+    counts.scatter_add_(1, index.unsqueeze(-1),
+                        hidden.new_ones(batch, length, 1))
+    return sums / counts.clamp(min=1.0)
+
+
+def check_gradient_flow(model, input_ids, labels, verbose=True, loss_fn=None):
+    """Report trainable parameters that receive no gradient.
+
+    Exists because a whole adapter family (LoRA) silently sat outside the
+    autograd graph: the parameters were created, counted and handed to the
+    optimizer, but no gradient ever reached them, so training was a no-op for
+    them. Cheap enough to run once at the start of every training job.
+    """
+    was_training = model.training
+    model.train()
+    model.zero_grad(set_to_none=True)
+
+    output = model(input_ids, labels)
+    # Use the caller's real objective when given. Checking only the
+    # classification loss would flag the FAISS embedding head as detached,
+    # since it is trained by the contrastive term instead.
+    loss = loss_fn(output, labels) if loss_fn is not None else output[0]
+    loss.backward()
+
+    # Two outcomes must be told apart:
+    #   grad is None  -> the tensor is outside the autograd graph. Always a bug.
+    #   grad all zero -> it is connected but this step gives no signal. For
+    #                    lora_A that is expected at initialisation, because
+    #                    lora_B starts at zero and grad_A is proportional to B.
+    connected, zero, detached = [], [], []
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        if param.grad is None:
+            detached.append(name)
+        elif not torch.any(param.grad != 0):
+            zero.append(name)
+        else:
+            connected.append(name)
+
+    model.zero_grad(set_to_none=True)
+    if not was_training:
+        model.eval()
+
+    if verbose:
+        total = len(connected) + len(zero) + len(detached)
+        logger.info("Gradient flow check: %d/%d trainable tensors receive a "
+                    "non-zero gradient (%d zero, %d detached)",
+                    len(connected), total, len(zero), len(detached))
+        if detached:
+            logger.error("%d trainable tensor(s) are NOT in the autograd "
+                         "graph and can never learn: %s%s",
+                         len(detached), ", ".join(detached[:8]),
+                         " ..." if len(detached) > 8 else "")
+        if zero:
+            logger.info("Zero-gradient this step (expected for lora_A while "
+                        "lora_B is still zero): %s%s",
+                        ", ".join(zero[:5]), " ..." if len(zero) > 5 else "")
+
+    return {"with_grad": connected, "zero_grad": zero,
+            "detached": detached,
+            "without_grad": zero + detached}  # kept for older callers
+
+
+#: Hyperparameters that change what a checkpoint *means*. If any of these
+#: differ between training and inference, the weights are being run under a
+#: different model and the scores are silently wrong.
+ARCHITECTURE_KEYS = (
+    "encoder_mode", "gnn", "format", "window_size", "block_size",
+    "feature_dim_size", "hidden_size", "num_GNN_layers", "att_op",
+    "remove_residual", "num_classes", "use_lora", "lora_rank", "lora_alpha",
+    "use_faiss", "embed_dim",
+)
+
+MODEL_CONFIG_FILENAME = "model_config.json"
+
+
+def save_model_config(checkpoint_dir, args, model=None):
+    """Write the architecture sidecar next to a checkpoint.
+
+    ``encoder_mode`` in particular cannot be recovered from the state dict --
+    both modes have exactly the same parameter names and shapes -- so without
+    this file a checkpoint trained in one mode loads silently into the other.
+    """
+    import json
+
+    config = {}
+    for key in ARCHITECTURE_KEYS:
+        if hasattr(args, key):
+            value = getattr(args, key)
+            config[key] = value.item() if hasattr(value, "item") else value
+    if model is not None and hasattr(model, "encoder_mode"):
+        config["encoder_mode"] = model.encoder_mode  # resolved, never "auto"
+
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    path = os.path.join(checkpoint_dir, MODEL_CONFIG_FILENAME)
+    with open(path, "w") as fh:
+        json.dump(config, fh, indent=2)
+    logger.info("Saved architecture config to %s", path)
+    return path
+
+
+def load_model_config(checkpoint_path):
+    """Read the sidecar for a checkpoint file or directory (None if absent)."""
+    import json
+
+    # Anything that is not an existing directory is treated as a file path,
+    # so a checkpoint that has not been written yet still resolves correctly.
+    directory = checkpoint_path if os.path.isdir(checkpoint_path) \
+        else os.path.dirname(checkpoint_path)
+    path = os.path.join(directory, MODEL_CONFIG_FILENAME)
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path) as fh:
+            return json.load(fh)
+    except Exception as exc:                              # pragma: no cover
+        logger.warning("Could not read %s: %s", path, exc)
+        return None
+
+
+def apply_model_config(args, config, override=True):
+    """Align ``args`` with a checkpoint's architecture, reporting conflicts."""
+    if not config:
+        return []
+
+    conflicts = []
+    for key, saved in config.items():
+        current = getattr(args, key, None)
+        if current is None or current == saved:
+            continue
+        # "auto" is a request to be resolved, not a genuine disagreement
+        if key == "encoder_mode" and current == "auto":
+            setattr(args, key, saved)
+            continue
+        conflicts.append((key, current, saved))
+        if override:
+            setattr(args, key, saved)
+
+    for key, current, saved in conflicts:
+        logger.warning(
+            "Checkpoint was trained with %s=%r but %r was requested; %s",
+            key, saved, current,
+            "using the checkpoint's value" if override else "keeping the request",
+        )
+    return conflicts
+
+
+SLIM_FORMAT = "slim-v1"
+
+
+def save_checkpoint_weights(path, model, args=None, slim=True,
+                            pretrained_prefix='encoder.roberta.'):
+    """Save model weights, optionally storing only what training can change.
+
+    With LoRA the state dict is ~125M parameters of which ~0.8M are trainable;
+    the rest is a byte-identical copy of the pretrained encoder that is
+    reconstructed from ``model_name_or_path`` on load anyway. Writing it every
+    epoch costs ~500 MB per checkpoint, which matters on hosted runtimes where
+    checkpoints go to Google Drive.
+
+    Slim payloads are self-describing, so ``load_checkpoint_weights`` accepts
+    both formats and old full checkpoints keep working.
+    """
+    model_to_save = model.module if hasattr(model, 'module') else model
+
+    if not slim:
+        torch.save(model_to_save.state_dict(), path)
+        return {"format": "full",
+                "tensors": len(model_to_save.state_dict())}
+
+    # What may be omitted is exactly what `from_pretrained` restores
+    # deterministically -- the contents of the pretrained file, i.e.
+    # `encoder.roberta.*`. Everything else must be stored even when frozen:
+    # RobertaForSequenceClassification's task head is randomly initialised on
+    # every construction (it is reported MISSING when loading the pretrained
+    # weights), so omitting it would silently change the model on reload.
+    trainable = {}
+    for name, param in model_to_save.named_parameters():
+        if param.requires_grad or not name.startswith(pretrained_prefix):
+            trainable[name] = param.detach().cpu()
+    # Buffers are tiny and can change during training, so always keep them.
+    buffers = {name: buf.detach().cpu()
+               for name, buf in model_to_save.named_buffers()}
+
+    payload = {
+        "__format__": SLIM_FORMAT,
+        "trainable": trainable,
+        "buffers": buffers,
+        # Recorded so a slim checkpoint cannot be silently loaded onto a model
+        # built from different base weights.
+        "base_model": getattr(args, "model_name_or_path", "") if args else "",
+        "encoder_mode": getattr(model_to_save, "encoder_mode", ""),
+        "pretrained_prefix": pretrained_prefix,
+    }
+    torch.save(payload, path)
+    return {"format": SLIM_FORMAT, "tensors": len(trainable),
+            "params": sum(t.numel() for t in trainable.values())}
+
+
+def load_checkpoint_weights(path, model, device=None, args=None):
+    """Load either checkpoint format onto ``model``.
+
+    A slim checkpoint only carries the trainable tensors, so the model must
+    already hold the pretrained base weights -- which is what constructing it
+    from ``model_name_or_path`` does.
+    """
+    model_to_load = model.module if hasattr(model, 'module') else model
+    obj = torch.load(path, map_location=device or "cpu", weights_only=False)
+
+    if not (isinstance(obj, dict) and obj.get("__format__") == SLIM_FORMAT):
+        missing, unexpected = model_to_load.load_state_dict(obj, strict=False)
+        if missing or unexpected:
+            logger.warning("Checkpoint mismatch: %d missing, %d unexpected "
+                           "(e.g. %s / %s)", len(missing), len(unexpected),
+                           list(missing)[:2], list(unexpected)[:2])
+        logger.info("Loaded full checkpoint %s", path)
+        return {"format": "full"}
+
+    expected_base = obj.get("base_model", "")
+    actual_base = getattr(args, "model_name_or_path", "") if args else ""
+    if expected_base and actual_base and expected_base != actual_base:
+        logger.warning(
+            "Slim checkpoint was trained on base model %r but this run builds "
+            "from %r; the frozen weights differ and results will be wrong.",
+            expected_base, actual_base)
+
+    saved = {**obj.get("trainable", {}), **obj.get("buffers", {})}
+    own = dict(model_to_load.named_parameters())
+    own.update(dict(model_to_load.named_buffers()))
+    unknown = [n for n in saved if n not in own]
+    if unknown:
+        raise ValueError(
+            f"Slim checkpoint {path} holds tensors this model does not have: "
+            f"{unknown[:5]}. Architecture mismatch -- check model_config.json.")
+
+    model_to_load.load_state_dict(saved, strict=False)
+    logger.info("Loaded slim checkpoint %s (%d tensors, %s params; base "
+                "weights come from the pretrained model)",
+                path, len(obj.get("trainable", {})),
+                f"{sum(t.numel() for t in obj.get('trainable', {}).values()):,}")
+    return {"format": SLIM_FORMAT, "encoder_mode": obj.get("encoder_mode", "")}
+
+
+def resolve_device(no_cuda=False, prefer=None):
+    """Pick the best available accelerator: CUDA, then Apple MPS, then CPU.
+
+    Without this, `torch.device("cuda" if is_available() else "cpu")` silently
+    falls back to CPU on Apple silicon, leaving the GPU unused.
+    """
+    if prefer:
+        return torch.device(prefer)
+    if not no_cuda and torch.cuda.is_available():
+        return torch.device("cuda")
+    if not no_cuda and getattr(torch.backends, "mps", None) is not None \
+            and torch.backends.mps.is_available():
+        return torch.device("mps")
+    return torch.device("cpu")
+
 
 def _get_device(tensor_or_module):
     """Infer device from a tensor or module instead of relying on a global variable."""
@@ -214,8 +517,60 @@ class GNNReGVD(nn.Module):
                 self.encoder, rank=lora_rank, alpha=lora_alpha
             )
 
-        # Word embeddings from encoder (for graph construction)
+        # ── How node features are produced ──────────────────────────────
+        # "static":     features are looked up in a detached copy of the
+        #               embedding table. This is the original ReGVD design;
+        #               the transformer is NEVER executed, so LoRA adapters
+        #               sit outside the autograd graph and cannot train.
+        # "contextual": the encoder runs and node features are pooled from
+        #               its hidden states, so gradients reach the encoder
+        #               (and the LoRA adapters).
+        # "auto":       contextual when LoRA is on, static otherwise.
+        self.encoder_mode = getattr(args, 'encoder_mode', 'auto')
+        if self.encoder_mode == 'auto':
+            self.encoder_mode = 'contextual' if self.use_lora else 'static'
+        if self.encoder_mode not in ('static', 'contextual'):
+            raise ValueError(
+                f"encoder_mode must be 'static', 'contextual' or 'auto', "
+                f"got {self.encoder_mode!r}"
+            )
+
+        if self.use_lora and self.encoder_mode == 'static':
+            logger.warning(
+                "use_lora=True with encoder_mode='static': the encoder is "
+                "never executed in static mode, so the LoRA adapters receive "
+                "no gradient and will stay at their initial values "
+                "(lora_B is zeroed, so they are an exact no-op). "
+                "Use --encoder_mode contextual to actually train them."
+            )
+        if not self.use_lora and self.encoder_mode == 'contextual':
+            logger.warning(
+                "encoder_mode='contextual' without LoRA: this is FULL "
+                "fine-tuning -- all ~125M encoder weights are trainable and "
+                "will be updated. Expect high memory use and a slow epoch. "
+                "Add --use_lora to train ~0.3M adapter weights instead."
+            )
+
+        # In static mode the encoder is never executed, so every parameter in
+        # it is dead weight: it would be handed to the optimizer, counted as
+        # "trainable" and never receive a gradient. Freezing it here is what
+        # makes the reported parameter counts mean something. (LoRA adapters
+        # are frozen too -- the warning above already says they cannot train.)
+        if self.encoder_mode == "static":
+            frozen = 0
+            for param in self.encoder.parameters():
+                if param.requires_grad:
+                    param.requires_grad = False
+                    frozen += param.numel()
+            if frozen:
+                logger.info("encoder_mode='static': froze %s encoder "
+                            "parameters that the forward pass never touches",
+                            f"{frozen:,}")
+
+        # Word embeddings from encoder (static feature path only)
         self.w_embeddings = self.encoder.roberta.embeddings.word_embeddings.weight.data.cpu().detach().clone().numpy()
+        self.pad_token_id = getattr(tokenizer, 'pad_token_id', 1) \
+            if tokenizer is not None else 1
         self.tokenizer = tokenizer
 
         # GNN
@@ -243,6 +598,15 @@ class GNNReGVD(nn.Module):
         # Classification head (binary: vuln/safe)
         self.classifier = PredictionClassification(config, args, input_size=gnn_out_dim)
 
+        if getattr(args, 'num_classes', 1) > 1:
+            logger.warning(
+                "num_classes=%d but the head is a single-logit sigmoid "
+                "classifier: the loss and all metrics use prob[:, 0], so the "
+                "remaining output column(s) receive no gradient. Set "
+                "--num_classes 1 for new runs (existing checkpoints keep "
+                "their shape).", args.num_classes,
+            )
+
         # FAISS embedding head (optional)
         self.use_faiss = getattr(args, 'use_faiss', False)
         self.embedding_head = None
@@ -254,37 +618,59 @@ class GNNReGVD(nn.Module):
                 dropout=config.hidden_dropout_prob
             )
 
-    def forward(self, input_ids=None, labels=None):
-        # Infer device from input tensor (not from global variable)
+    def _build_inputs(self, input_ids):
+        """Produce (adj, adj_mask, node_features) for a batch.
+
+        In contextual mode the returned node features carry gradient back to
+        the encoder; in static mode they are a constant tensor.
+        """
         _dev = input_ids.device
+        ids_np = input_ids.cpu().detach().numpy()
 
-        # ── Construct graph ──
+        if self.encoder_mode == "static":
+            if self.args.format == "uni":
+                adj, x_feature = build_graph(
+                    ids_np, self.w_embeddings,
+                    window_size=self.args.window_size
+                )
+            else:
+                adj, x_feature = build_graph_text(
+                    ids_np, self.w_embeddings,
+                    window_size=self.args.window_size
+                )
+            adj, adj_mask = preprocess_adj(adj)
+            adj_feature = preprocess_features(x_feature)
+            return (_to_device(adj, _dev), _to_device(adj_mask, _dev),
+                    _to_device(adj_feature, _dev))
+
+        # ── contextual ──
         if self.args.format == "uni":
-            adj, x_feature = build_graph(
-                input_ids.cpu().detach().numpy(),
-                self.w_embeddings,
-                window_size=self.args.window_size
-            )
+            adj, node_ids = build_graph_index(
+                ids_np, window_size=self.args.window_size)
         else:
-            adj, x_feature = build_graph_text(
-                input_ids.cpu().detach().numpy(),
-                self.w_embeddings,
-                window_size=self.args.window_size
-            )
+            adj, node_ids = build_graph_text_index(
+                ids_np, window_size=self.args.window_size)
 
-        # ── Preprocessing ──
         adj, adj_mask = preprocess_adj(adj)
-        adj_feature = preprocess_features(x_feature)
-        adj = torch.from_numpy(adj)
-        adj_mask = torch.from_numpy(adj_mask)
-        adj_feature = torch.from_numpy(adj_feature)
+        adj = _to_device(adj, _dev)
+        adj_mask = _to_device(adj_mask, _dev)
+
+        # This is the call that was missing: without it the encoder -- and
+        # every LoRA adapter inside it -- is not part of the autograd graph.
+        hidden = self.encoder.roberta(
+            input_ids,
+            attention_mask=input_ids.ne(self.pad_token_id),
+        )[0]
+
+        adj_feature = pool_positions_to_nodes(hidden, node_ids,
+                                              n_nodes=adj.shape[1])
+        return adj, adj_mask, adj_feature
+
+    def forward(self, input_ids=None, labels=None):
+        adj, adj_mask, adj_feature = self._build_inputs(input_ids)
 
         # ── GNN forward ──
-        gnn_output = self.gnn(
-            adj_feature.to(_dev).float(),
-            adj.to(_dev).float(),
-            adj_mask.to(_dev).float()
-        )
+        gnn_output = self.gnn(adj_feature, adj, adj_mask)
 
         # ── Classification head ──
         logits = self.classifier(gnn_output)
@@ -310,33 +696,9 @@ class GNNReGVD(nn.Module):
         Get only the FAISS embedding for a batch (no classification).
         Used for building/updating the FAISS index.
         """
-        _dev = input_ids.device
-
         with torch.no_grad():
-            if self.args.format == "uni":
-                adj, x_feature = build_graph(
-                    input_ids.cpu().detach().numpy(),
-                    self.w_embeddings,
-                    window_size=self.args.window_size
-                )
-            else:
-                adj, x_feature = build_graph_text(
-                    input_ids.cpu().detach().numpy(),
-                    self.w_embeddings,
-                    window_size=self.args.window_size
-                )
-
-            adj, adj_mask = preprocess_adj(adj)
-            adj_feature = preprocess_features(x_feature)
-            adj = torch.from_numpy(adj)
-            adj_mask = torch.from_numpy(adj_mask)
-            adj_feature = torch.from_numpy(adj_feature)
-
-            gnn_output = self.gnn(
-                adj_feature.to(_dev).float(),
-                adj.to(_dev).float(),
-                adj_mask.to(_dev).float()
-            )
+            adj, adj_mask, adj_feature = self._build_inputs(input_ids)
+            gnn_output = self.gnn(adj_feature, adj, adj_mask)
 
             if self.embedding_head is not None:
                 return self.embedding_head(gnn_output)
@@ -349,12 +711,32 @@ class GNNReGVD(nn.Module):
         trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
         frozen = total - trainable
 
+        # LoRA params only count as effectively trainable when the encoder is
+        # actually executed -- see the encoder_mode note in __init__.
+        lora_effective = self.lora_param_count \
+            if self.encoder_mode == "contextual" else 0
+        effective = trainable - (self.lora_param_count - lora_effective)
+
+        # The head is a single-logit sigmoid classifier: the loss and every
+        # evaluation path read prob[:, 0] only. Any further output column is
+        # allocated but never receives gradient.
+        num_classes = getattr(self.args, "num_classes", 1)
+        dead_head = 0
+        if num_classes > 1:
+            per_class = self.classifier.out_proj.weight.shape[1] + 1
+            dead_head = (num_classes - 1) * per_class
+            effective -= dead_head
+
         info = {
             "total_params": total,
             "trainable_params": trainable,
             "frozen_params": frozen,
             "trainable_percent": round(100 * trainable / max(total, 1), 2),
             "lora_params": self.lora_param_count,
+            "lora_params_effective": lora_effective,
+            "effective_trainable_params": effective,
+            "dead_classifier_params": dead_head,
+            "encoder_mode": self.encoder_mode,
         }
         return info
 

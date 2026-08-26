@@ -35,7 +35,7 @@ import torch
 from torch.utils.data import DataLoader, SequentialSampler
 from transformers import RobertaConfig, RobertaForSequenceClassification, RobertaTokenizer
 
-from model import GNNReGVD
+from model import GNNReGVD, resolve_device
 from faiss_index import FAISSIndexManager
 from run import TextDataset, set_seed
 
@@ -261,6 +261,11 @@ def main():
     parser.add_argument("--att_op", default='mul', type=str)
 
     # LoRA / FAISS config (must match training)
+    parser.add_argument("--encoder_mode", type=str, default="auto",
+                        choices=["auto", "static", "contextual"],
+                        help="static: frozen embedding lookup (LoRA cannot train); "
+                             "contextual: run the encoder so LoRA gets gradient; "
+                             "auto: contextual iff --use_lora")
     parser.add_argument("--use_lora", action='store_true')
     parser.add_argument("--lora_rank", type=int, default=8)
     parser.add_argument("--lora_alpha", type=int, default=16)
@@ -274,7 +279,7 @@ def main():
     args = parser.parse_args()
 
     # Setup
-    device = torch.device("cuda" if torch.cuda.is_available() and not args.no_cuda else "cpu")
+    device = resolve_device(no_cuda=args.no_cuda, prefer=getattr(args, "device_override", None))
     args.device = device
     args.n_gpu = torch.cuda.device_count() if not args.no_cuda else 0
     args.per_gpu_eval_batch_size = args.eval_batch_size // max(args.n_gpu, 1)

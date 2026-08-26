@@ -125,6 +125,43 @@ python scan_cli.py --sandbox-only \
     --llm-model "qwen2.5-coder:7b"
 ```
 
+### Project-level scanning (Module 0: interprocedural inlining)
+
+The scanner analyses functions, but a vulnerability is often only visible when a
+caller and its callee are read together — and they usually live in different
+files. Module 0 splits a whole project into *analysis units*: each function with
+the bodies of the functions it calls inlined into it, up to a configurable
+depth and within the detector's token window.
+
+```bash
+# Split the project into units and stop — no GNN, no LLM, no sandbox.
+# Use this to inspect the split on its own.
+python scan_cli.py --project ./myproject --build-units-only \
+    --inline-depth 2 --units-out units.jsonl --units-stats stats.json
+```
+
+```bash
+# Same thing through the module's own CLI, with the units printed out
+python -m interproc.cli --project ./myproject --inline-depth 2 --show 3
+```
+
+```bash
+# Full pipeline over a project
+python scan_cli.py --project ./myproject --inline-depth 2 \
+    --model-path code/saved_models/lora_faiss/checkpoint-best-acc/model.bin \
+    --faiss-dir code/saved_models/lora_faiss/faiss_index
+```
+
+`--inline-depth` is the depth hyperparameter: `0` reproduces the current
+single-function behaviour byte for byte, `1` inlines direct callees, `2` also
+inlines theirs. Because the detector only sees `block_size - 2 = 398` BPE
+tokens, call sites are inlined in order of security relevance (callees
+containing dangerous sinks and callees receiving caller-derived arguments go
+first) rather than in source order; `--inline-strategy` switches that off.
+
+Each unit carries two views of the code: an inlined one for the GNN, and a
+self-contained compilable bundle for the LLM harness generator and the sandbox.
+
 ### Full pipeline (GNN + Exploit + Sandbox)
 
 ```bash
@@ -159,6 +196,13 @@ python evaluate.py --mode sandbox-only --limit 20 --timeout 10
 
 ```
 GNN-ReGVD/
+├── interproc/              # Module 0: Interprocedural Inlining
+│   ├── clex.py             #   C/C++ lexical scanner (code vs string/comment)
+│   ├── discovery.py        #   Project walk + parse cache
+│   ├── callgraph.py        #   Call resolution (TU rules, arity, SCC)
+│   ├── inliner.py          #   Depth-limited, budget-aware expansion
+│   ├── bundler.py          #   Compilable dependency bundle for the sandbox
+│   └── cli.py              #   Standalone CLI (python -m interproc.cli)
 ├── code/                   # Module 1: GNN Detection
 │   ├── model.py            #   GNNReGVD + LoRA + EmbeddingHead
 │   ├── modelGNN_updates.py #   ReGCN, ReGGNN with residual connections

@@ -40,6 +40,18 @@ class ScanResult:
     triage_verdict: str = ""          # "true_positive" / "false_positive" / "uncertain"
     triage_confidence: float = 0.0
     triage_reasoning: str = ""
+    # Module 0 provenance (project-level scanning). All defaulted so that
+    # existing callers -- including ScanResult(**filtered) in scan_cli -- keep
+    # working unchanged.
+    unit_id: str = ""
+    file: str = ""
+    function: str = ""
+    start_line: int = 0
+    end_line: int = 0
+    inline_depth_used: int = 0
+    inlined_functions: List[str] = field(default_factory=list)
+    provenance_files: List[str] = field(default_factory=list)
+    inline_truncated: bool = False
 
 
 class VulnerabilityScanner:
@@ -707,7 +719,8 @@ class VulnerabilityScanner:
         from transformers import (RobertaConfig,
                                   RobertaForSequenceClassification,
                                   RobertaTokenizer)
-        from model import GNNReGVD
+        from model import (GNNReGVD, apply_model_config, load_model_config,
+                           load_checkpoint_weights)
         from faiss_index import FAISSIndexManager
         from inference import HybridPredictor
 
@@ -731,12 +744,32 @@ class VulnerabilityScanner:
             **vars(self.config), 'device': device,
             'n_gpu': 0, 'local_rank': -1,
         })()
+
+        # A checkpoint's state dict is identical in both encoder modes, so
+        # loading one under the wrong mode fails silently and produces wrong
+        # scores. The sidecar written at training time settles it.
+        checkpoint_config = None
+        if self.config.model_path and os.path.exists(self.config.model_path):
+            checkpoint_config = load_model_config(self.config.model_path)
+            if checkpoint_config:
+                apply_model_config(args, checkpoint_config, override=True)
+            else:
+                logger.warning(
+                    "[Init] No %s next to %s — assuming encoder_mode=%r. "
+                    "If this checkpoint was trained before the sidecar "
+                    "existed, it used encoder_mode='static'.",
+                    "model_config.json", self.config.model_path,
+                    getattr(args, "encoder_mode", "auto"),
+                )
+
         model = GNNReGVD(encoder, roberta_config, tokenizer, args)
 
         if self.config.model_path and os.path.exists(self.config.model_path):
-            model.load_state_dict(
-                torch.load(self.config.model_path, map_location=device)
-            )
+            # Handles both the slim format (trainable tensors only, base
+            # weights rebuilt from the pretrained model) and old full ones.
+            load_checkpoint_weights(self.config.model_path, model, device, args)
+            logger.info("[Init] Loaded checkpoint %s (encoder_mode=%s)",
+                        self.config.model_path, model.encoder_mode)
 
         faiss_manager = None
         if self.config.faiss_dir and os.path.exists(self.config.faiss_dir):
