@@ -370,17 +370,21 @@ def train(args, train_dataset, model, tokenizer):
         # Early-stopping state only means something for the metric it was
         # recorded against: restoring an eval_loss best of 0.61 and then
         # comparing eval_auc against it would be nonsense.
-        prior_metric = resumed.get("early_stopping_metric",
-                                   args.early_stopping_metric)
+        # Absent key means the snapshot predates this field: we cannot know
+        # which metric its best value belongs to, so the safe reading is
+        # "unknown", not "same as now". Defaulting to the current metric would
+        # restore a stale threshold and patience counter and could stop the
+        # run on its very first epoch.
+        prior_metric = resumed.get("early_stopping_metric")
         if prior_metric == args.early_stopping_metric:
             best_metric = resumed.get("best_metric", best_metric)
             epochs_without_improvement = resumed.get(
                 "epochs_without_improvement", 0)
         else:
             logger.warning(
-                "Early stopping metric changed (%s -> %s); resetting its "
-                "best value and patience counter.",
-                prior_metric, args.early_stopping_metric)
+                "Early stopping state does not match metric %r (snapshot: "
+                "%s); resetting its best value and patience counter.",
+                args.early_stopping_metric, prior_metric or "not recorded")
         logger.info("Resuming at epoch %d (global_step %d, best_acc %.4f)",
                     args.start_epoch, global_step, best_acc)
     model.zero_grad()
