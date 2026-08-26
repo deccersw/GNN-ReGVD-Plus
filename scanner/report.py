@@ -57,6 +57,14 @@ def format_report(result: ScanResult, code_snippet: str = "",
                 reasoning += "..."
             lines.append(f"    Reasoning:  {reasoning}")
 
+    if result.file:
+        location = f"{result.file}:{result.function}:{result.start_line}"
+        lines.append(f"\n  Location:     {location}")
+        if result.inlined_functions:
+            lines.append(f"    Inlined:    {', '.join(result.inlined_functions)}")
+        if result.inline_truncated:
+            lines.append(f"    Truncated:  yes (unit exceeded the token window)")
+
     if code_snippet:
         lines.append(f"\n  Code (first 200 chars):")
         lines.append(f"    {code_snippet[:200]}")
@@ -84,6 +92,21 @@ def to_json(result: ScanResult) -> str:
         data["triage_verdict"] = result.triage_verdict
         data["triage_confidence"] = result.triage_confidence
         data["triage_reasoning"] = result.triage_reasoning
+
+    # Module 0 provenance. A project-level report without it cannot say which
+    # function a verdict belongs to, which makes the whole result unusable.
+    if result.unit_id or result.file:
+        data.update({
+            "unit_id": result.unit_id,
+            "file": result.file,
+            "function": result.function,
+            "start_line": result.start_line,
+            "end_line": result.end_line,
+            "inline_depth_used": result.inline_depth_used,
+            "inlined_functions": result.inlined_functions,
+            "provenance_files": result.provenance_files,
+            "inline_truncated": result.inline_truncated,
+        })
     return json.dumps(data, indent=2)
 
 
