@@ -533,8 +533,7 @@ def train(args, train_dataset, model, tokenizer):
         best_model_path = os.path.join(args.output_dir, 'checkpoint-best-acc', 'model.bin')
         if os.path.exists(best_model_path):
             logger.info(f"Loading best model from {best_model_path} for FAISS index")
-            model_to_save = model.module if hasattr(model, 'module') else model
-            model_to_save.load_state_dict(torch.load(best_model_path))
+            load_checkpoint_weights(best_model_path, model, args.device, args)
         build_faiss_index(args, model, tokenizer, train_dataset)
 
 

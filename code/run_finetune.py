@@ -43,7 +43,7 @@ try:
 except ImportError:
     from torch.optim import AdamW
 
-from model import GNNReGVD, resolve_device
+from model import GNNReGVD, resolve_device, load_checkpoint_weights
 from faiss_index import FAISSIndexManager
 from losses import SupervisedContrastiveLoss, TripletMarginLossWithMining
 from run import TextDataset, set_seed, evaluate
@@ -232,7 +232,7 @@ def lora_finetune(args, model, tokenizer):
         # Load best model if we saved one
         best_path = os.path.join(args.output_dir, 'checkpoint-best-acc', 'model.bin')
         if os.path.exists(best_path):
-            model.load_state_dict(torch.load(best_path, map_location=device))
+            load_checkpoint_weights(best_path, model, device, args)
             model.to(args.device)
 
         # Rebuild from ALL available data
@@ -373,7 +373,7 @@ def main():
 
     # Load trained weights
     logger.info(f"Loading model from {args.model_path}")
-    model.load_state_dict(torch.load(args.model_path, map_location=device))
+    load_checkpoint_weights(args.model_path, model, device, args)
     model.to(device)
 
     # Dispatch

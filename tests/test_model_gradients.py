@@ -602,3 +602,33 @@ class TestSlimCheckpoints:
         save_checkpoint_weights(str(path), model, slim=True)
         payload = torch.load(str(path), weights_only=False)
         assert not any(n.startswith("encoder.") for n in payload["trainable"])
+
+
+class TestNoRawCheckpointLoads:
+    """Every model checkpoint must go through load_checkpoint_weights().
+
+    Slim payloads are dicts with a __format__ key, not state dicts, so a raw
+    `load_state_dict(torch.load(path))` blows up on them. Four such call sites
+    survived the switch to the slim format and only surfaced when a real Colab
+    run crashed after training, while building the FAISS index.
+    """
+
+    def test_no_module_loads_a_model_checkpoint_directly(self):
+        import re
+        root = os.path.join(os.path.dirname(__file__), "..")
+        offenders = []
+        for rel in ("code/run.py", "code/run_finetune.py", "code/inference.py",
+                    "scanner/pipeline.py"):
+            path = os.path.join(root, rel)
+            if not os.path.exists(path):
+                continue
+            for i, line in enumerate(open(path), 1):
+                if re.search(r"load_state_dict\(\s*torch\.load", line):
+                    # optimizer/scheduler state is a plain dict and is fine
+                    if re.search(r"\b(optimizer|scheduler)\.load_state_dict", line):
+                        continue
+                    offenders.append(f"{rel}:{i}: {line.strip()}")
+        assert offenders == [], (
+            "these load a checkpoint without going through "
+            "load_checkpoint_weights(), so slim checkpoints will crash:\n"
+            + "\n".join(offenders))

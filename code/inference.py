@@ -35,7 +35,7 @@ import torch
 from torch.utils.data import DataLoader, SequentialSampler
 from transformers import RobertaConfig, RobertaForSequenceClassification, RobertaTokenizer
 
-from model import GNNReGVD, resolve_device
+from model import GNNReGVD, resolve_device, load_checkpoint_weights
 from faiss_index import FAISSIndexManager
 from run import TextDataset, set_seed
 
@@ -297,7 +297,7 @@ def main():
 
     model = GNNReGVD(encoder, config, tokenizer, args)
     logger.info(f"Loading model from {args.model_path}")
-    model.load_state_dict(torch.load(args.model_path, map_location=device))
+    load_checkpoint_weights(args.model_path, model, device, args)
 
     # Load FAISS index
     faiss_manager = None
