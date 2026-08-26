@@ -211,7 +211,9 @@ def save_training_checkpoint(args, model, optimizer, scheduler, epoch,
     with open(os.path.join(checkpoint_dir, 'training_state.json'), 'w') as fh:
         json.dump({"epoch": epoch, "global_step": global_step,
                    "best_acc": best_acc, "best_metric": best_metric,
-                   "epochs_without_improvement": epochs_without_improvement}, fh)
+                   "epochs_without_improvement": epochs_without_improvement,
+                   "early_stopping_metric": getattr(
+                       args, "early_stopping_metric", "eval_loss")}, fh)
 
     logger.info("Saved resumable checkpoint to %s (epoch %d)",
                 checkpoint_dir, epoch)
@@ -365,8 +367,20 @@ def train(args, train_dataset, model, tokenizer):
     resumed = load_training_state(args.output_dir)
     if resumed:
         best_acc = resumed.get("best_acc", 0.0)
-        best_metric = resumed.get("best_metric", best_metric)
-        epochs_without_improvement = resumed.get("epochs_without_improvement", 0)
+        # Early-stopping state only means something for the metric it was
+        # recorded against: restoring an eval_loss best of 0.61 and then
+        # comparing eval_auc against it would be nonsense.
+        prior_metric = resumed.get("early_stopping_metric",
+                                   args.early_stopping_metric)
+        if prior_metric == args.early_stopping_metric:
+            best_metric = resumed.get("best_metric", best_metric)
+            epochs_without_improvement = resumed.get(
+                "epochs_without_improvement", 0)
+        else:
+            logger.warning(
+                "Early stopping metric changed (%s -> %s); resetting its "
+                "best value and patience counter.",
+                prior_metric, args.early_stopping_metric)
         logger.info("Resuming at epoch %d (global_step %d, best_acc %.4f)",
                     args.start_epoch, global_step, best_acc)
     model.zero_grad()
