@@ -632,3 +632,173 @@ class TestNoRawCheckpointLoads:
             "these load a checkpoint without going through "
             "load_checkpoint_weights(), so slim checkpoints will crash:\n"
             + "\n".join(offenders))
+
+
+# ----------------------------------------------------------------------
+# pos_weight on the classification loss
+# ----------------------------------------------------------------------
+
+class TestPosWeight:
+    """Unweighted BCE collapses to all-negative on an imbalanced corpus.
+
+    MegaVul is 4.7% positive: there, predicting "safe" for everything scores
+    0.953 accuracy, and plain BCE walks straight to it. pos_weight is what
+    makes the positive class cost enough to matter.
+    """
+
+    def test_default_is_plain_bce(self):
+        model = make_model()
+        assert model.pos_weight == 1.0
+
+    def test_absent_attribute_defaults_to_one(self):
+        args = make_args()
+        assert not hasattr(args, "pos_weight")
+        model = GNNReGVD(FakeEncoder(), FakeConfig(), None, args)
+        assert model.pos_weight == 1.0
+
+    def test_weight_reaches_the_loss(self):
+        ids, labels = batch()
+        base = make_model(pos_weight=1.0)
+        loss_plain = base(ids, labels)[0]
+
+        weighted = make_model(pos_weight=10.0)
+        loss_weighted = weighted(ids, labels)[0]
+
+        # Same weights, same batch: only the positive term is rescaled, and
+        # the batch has positives, so the loss has to move.
+        assert not torch.isclose(loss_plain, loss_weighted)
+
+    def test_weight_only_touches_the_positive_term(self):
+        ids = torch.randint(5, VOCAB, (4, SEQ))
+        all_negative = torch.zeros(4)
+        plain = make_model(pos_weight=1.0)(ids, all_negative)[0]
+        heavy = make_model(pos_weight=50.0)(ids, all_negative)[0]
+        # With no positives in the batch the weight has nothing to scale.
+        assert torch.isclose(plain, heavy)
+
+    def test_gradient_still_flows_with_a_weight(self):
+        ids, labels = batch()
+        model = make_model(pos_weight=8.0, encoder_mode="contextual")
+        report = check_gradient_flow(model, ids, labels, verbose=False)
+        # The embedding head is trained by the contrastive term, so the
+        # classification loss alone legitimately leaves it out.
+        assert [n for n in report["detached"]
+                if "embedding_head" not in n] == []
+
+
+# ----------------------------------------------------------------------
+# --freeze_encoder
+# ----------------------------------------------------------------------
+
+class TestFreezeEncoder:
+    """The ablation arm that isolates LoRA.
+
+    Comparing "contextual + LoRA" against "static" conflates LoRA with the
+    change of node features. The only comparison that attributes a gain to
+    LoRA alone is against a contextual run whose encoder is frozen.
+    """
+
+    @staticmethod
+    def _trainable(model, predicate):
+        return sum(p.numel() for n, p in model.encoder.named_parameters()
+                   if p.requires_grad and predicate(n))
+
+    def test_freezes_the_encoder_but_keeps_lora_trainable(self):
+        model = make_model(encoder_mode="contextual", use_lora=True,
+                           freeze_encoder=True)
+        assert self._trainable(model, lambda n: "lora_" not in n) == 0
+        assert self._trainable(model, lambda n: "lora_" in n) > 0
+
+    def test_without_lora_nothing_in_the_encoder_trains(self):
+        model = make_model(encoder_mode="contextual", use_lora=False,
+                           freeze_encoder=True)
+        assert self._trainable(model, lambda n: True) == 0
+        # The GNN and the heads still have to train, or the arm is useless.
+        assert sum(p.numel() for p in model.gnn.parameters()
+                   if p.requires_grad) > 0
+
+    def test_off_by_default_contextual_without_lora_is_a_full_finetune(self):
+        model = make_model(encoder_mode="contextual", use_lora=False)
+        assert self._trainable(model, lambda n: True) > 0
+
+    def test_encoder_still_runs_when_frozen(self):
+        ids, labels = batch()
+        model = make_model(encoder_mode="contextual", use_lora=True,
+                           freeze_encoder=True)
+        assert model.encoder_mode == "contextual"
+        report = check_gradient_flow(model, ids, labels, verbose=False)
+        assert [n for n in report["detached"]
+                if "embedding_head" not in n] == []
+        # Frozen weights are excluded from the report, not silently detached.
+        assert any("lora_" in n for n in
+                   report["with_grad"] + report["zero_grad"])
+
+    def test_is_a_no_op_in_static_mode(self):
+        frozen = make_model(encoder_mode="static", use_lora=False,
+                            freeze_encoder=True)
+        plain = make_model(encoder_mode="static", use_lora=False)
+        assert self._trainable(frozen, lambda n: True) == \
+               self._trainable(plain, lambda n: True) == 0
+
+
+# ----------------------------------------------------------------------
+# --freeze_lora
+# ----------------------------------------------------------------------
+
+class TestFreezeLora:
+    """The control arm for "what does adapting LoRA to a new domain buy?".
+
+    Dropping --use_lora is not that control: it changes the architecture, and a
+    checkpoint carrying lora_A/lora_B tensors cannot be loaded into a model
+    without them at all. Freezing the adapters keeps everything identical
+    except whether they move.
+    """
+
+    @staticmethod
+    def _lora_params(model):
+        return [(n, p) for n, p in model.encoder.named_parameters()
+                if "lora_" in n]
+
+    def test_off_by_default(self):
+        model = make_model(encoder_mode="contextual")
+        assert any(p.requires_grad for _, p in self._lora_params(model))
+
+    def test_freezes_every_adapter(self):
+        model = make_model(encoder_mode="contextual", freeze_lora=True)
+        params = self._lora_params(model)
+        assert params, "sanity: the model does have adapters"
+        assert not any(p.requires_grad for _, p in params)
+
+    def test_adapters_stay_in_the_forward_pass(self):
+        """Frozen is not removed: the loaded adapter values must still apply."""
+        ids, _ = batch()
+        trained = make_model(encoder_mode="contextual", freeze_lora=True)
+        with torch.no_grad():
+            for name, param in trained.encoder.named_parameters():
+                if "lora_B" in name:
+                    param.fill_(0.05)      # make the adapters do something
+        model_off = make_model(encoder_mode="contextual", freeze_lora=True)
+        with torch.no_grad():
+            a = trained(ids)[0]
+            b = model_off(ids)[0]
+        assert not torch.allclose(a, b)
+
+    def test_gnn_and_heads_still_train(self):
+        model = make_model(encoder_mode="contextual", freeze_lora=True)
+        assert sum(p.numel() for p in model.gnn.parameters()
+                   if p.requires_grad) > 0
+        assert sum(p.numel() for p in model.classifier.parameters()
+                   if p.requires_grad) > 0
+
+    def test_combines_with_freeze_encoder(self):
+        """The encoder runs, yet nothing inside it can move."""
+        model = make_model(encoder_mode="contextual", freeze_encoder=True,
+                           freeze_lora=True)
+        assert sum(p.numel() for p in model.encoder.parameters()
+                   if p.requires_grad) == 0
+        assert model.encoder_mode == "contextual"
+
+    def test_is_a_no_op_without_lora(self):
+        model = make_model(encoder_mode="contextual", use_lora=False,
+                           freeze_lora=True)
+        assert self._lora_params(model) == []

@@ -567,6 +567,44 @@ class GNNReGVD(nn.Module):
                             "parameters that the forward pass never touches",
                             f"{frozen:,}")
 
+        # Contextual mode without LoRA means full fine-tuning of the encoder.
+        # --freeze_encoder gives the third option the ablation needs: run the
+        # encoder so node features are contextual, but train only the GNN and
+        # the heads. Without it there is no arm to compare LoRA against that
+        # differs from it in LoRA alone.
+        if self.encoder_mode == "contextual" and getattr(args, "freeze_encoder", False):
+            frozen = 0
+            for name, param in self.encoder.named_parameters():
+                if "lora_" in name or not param.requires_grad:
+                    continue
+                param.requires_grad = False
+                frozen += param.numel()
+            if frozen:
+                logger.info("--freeze_encoder: froze %s encoder parameters; "
+                            "the encoder still runs, only %s adapters train",
+                            f"{frozen:,}",
+                            "LoRA" if self.use_lora else "no")
+
+        # Keep the adapters in the graph but out of the optimizer. This is the
+        # control arm for "does adapting LoRA to a new domain help?": dropping
+        # --use_lora instead would change the architecture, and a checkpoint
+        # that carries LoRA tensors would not even load into it. Here the two
+        # arms differ in exactly one thing -- whether the adapters move.
+        if self.use_lora and getattr(args, "freeze_lora", False):
+            frozen = 0
+            for name, param in self.encoder.named_parameters():
+                if "lora_" in name and param.requires_grad:
+                    param.requires_grad = False
+                    frozen += param.numel()
+            logger.info("--freeze_lora: %s adapter parameters kept at their "
+                        "loaded values", f"{frozen:,}")
+
+        # Weight on the positive term of the classification loss. 1.0 keeps the
+        # plain BCE every earlier run used.
+        self.pos_weight = float(getattr(args, "pos_weight", 1.0) or 1.0)
+        if self.pos_weight != 1.0:
+            logger.info("Classification loss uses pos_weight=%.3f", self.pos_weight)
+
         # Word embeddings from encoder (static feature path only)
         self.w_embeddings = self.encoder.roberta.embeddings.word_embeddings.weight.data.cpu().detach().clone().numpy()
         self.pad_token_id = getattr(tokenizer, 'pad_token_id', 1) \
@@ -684,7 +722,12 @@ class GNNReGVD(nn.Module):
         # ── Loss computation ──
         if labels is not None:
             labels = labels.float()
-            cls_loss = torch.log(prob[:, 0] + 1e-10) * labels + \
+            # pos_weight scales the positive term, as in BCEWithLogitsLoss.
+            # Devign is ~46% positive, so unweighted BCE is fine there; on a
+            # corpus like MegaVul (4.7% positive) it drives the model straight
+            # to the all-negative solution, which scores a high accuracy and
+            # detects nothing.
+            cls_loss = self.pos_weight * torch.log(prob[:, 0] + 1e-10) * labels + \
                        torch.log((1 - prob)[:, 0] + 1e-10) * (1 - labels)
             cls_loss = -cls_loss.mean()
             return cls_loss, prob, embeddings
