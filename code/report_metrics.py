@@ -121,7 +121,16 @@ def by_truncation(rows, y, p):
               f"PR-AUC={ap:.4f} (lift x{ap / rate:.2f})")
 
 
-def paired(rows):
+#: Score gap below which two predictions count as the same answer. A pair whose
+#: two functions differ only past the token window reaches the model as one
+#: input and must tie, but floating-point reduction order varies with batch
+#: size, so those ties come back as differences around 1e-8. Without a
+#: tolerance the tie count -- and every rate derived from it -- changes with
+#: --batch_size.
+PAIR_TOL = 1e-6
+
+
+def paired(rows, tol=PAIR_TOL):
     by_pair = collections.defaultdict(dict)
     for row in rows:
         if row.get("role") in ("before", "after"):
@@ -131,11 +140,11 @@ def paired(rows):
         return
     before = np.array([x[0] for x in pairs])
     after = np.array([x[1] for x in pairs])
-    ties = float((before == after).mean())
-    wins = float((before > after).mean())
+    ties = float((np.abs(before - after) <= tol).mean())
+    wins = float((before > after + tol).mean())
     print(f"\n--- paired: vulnerable vs its own fix ({len(pairs)} pairs) ---")
     print(f"score(before) > score(after) = {wins:.4f}   (chance 0.5)")
-    print(f"identical scores             = {ties:.4f}")
+    print(f"tied within {tol:g}          = {ties:.4f}")
     if ties < 1:
         print(f"among non-tied pairs         = {wins / (1 - ties):.4f}")
     print(f"median delta                 = {np.median(before - after):+.5f}")
