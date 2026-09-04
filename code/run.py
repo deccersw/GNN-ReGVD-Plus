@@ -40,7 +40,9 @@ from torch.utils.data.distributed import DistributedSampler
 import json
 
 
-from sklearn.metrics import f1_score, precision_score, recall_score, roc_auc_score, confusion_matrix
+from sklearn.metrics import (f1_score, precision_score, recall_score,
+                             roc_auc_score, average_precision_score,
+                             confusion_matrix)
 
 try:
     from torch.utils.tensorboard import SummaryWriter
@@ -658,6 +660,13 @@ def evaluate(args, model, tokenizer, eval_when_training=False):
         eval_auc = roc_auc_score(labels, probs)
     except ValueError:
         eval_auc = 0.0
+    # On an imbalanced corpus ROC-AUC stays flattering while the model is
+    # useless; PR-AUC is the one to watch. Its random baseline is the positive
+    # rate, so it is reported alongside.
+    try:
+        eval_pr_auc = average_precision_score(labels, probs)
+    except ValueError:
+        eval_pr_auc = 0.0
 
     result = {
         "eval_loss": float(perplexity),
@@ -666,6 +675,8 @@ def evaluate(args, model, tokenizer, eval_when_training=False):
         "eval_precision": round(eval_precision, 4),
         "eval_recall": round(eval_recall, 4),
         "eval_auc": round(eval_auc, 4),
+        "eval_pr_auc": round(eval_pr_auc, 4),
+        "eval_positive_rate": round(float(np.mean(labels)), 4),
     }
     return result
 
@@ -712,14 +723,26 @@ def test(args, model, tokenizer):
         test_auc = roc_auc_score(labels, probs)
     except ValueError:
         test_auc = 0.0
+    try:
+        test_pr_auc = average_precision_score(labels, probs)
+    except ValueError:
+        test_pr_auc = 0.0
+    positive_rate = float(np.mean(labels))
     test_metrics = {
         "test_acc": round(float(test_acc), 4),
         "test_auc": round(float(test_auc), 4),
+        "test_pr_auc": round(float(test_pr_auc), 4),
         "test_f1": round(float(f1_score(labels, preds, zero_division=0)), 4),
         "test_precision": round(
             float(precision_score(labels, preds, zero_division=0)), 4),
         "test_recall": round(
             float(recall_score(labels, preds, zero_division=0)), 4),
+        # The two numbers every metric above has to be read against on an
+        # imbalanced corpus: predicting "safe" for everything scores
+        # 1 - positive_rate accuracy, and a random ranker scores
+        # positive_rate PR-AUC.
+        "test_positive_rate": round(positive_rate, 4),
+        "test_all_negative_acc": round(1.0 - positive_rate, 4),
     }
     with open(os.path.join(args.output_dir, "predictions.txt"), 'w') as f:
         for example, pred in zip(eval_dataset.examples, preds):
@@ -727,6 +750,13 @@ def test(args, model, tokenizer):
                 f.write(example.idx + '\t1\n')
             else:
                 f.write(example.idx + '\t0\n')
+
+    # The binary file above cannot support a PR curve, a threshold sweep or a
+    # bootstrap interval -- all of which need the score, not the decision.
+    with open(os.path.join(args.output_dir, "predictions_prob.jsonl"), 'w') as f:
+        for example, prob, label in zip(eval_dataset.examples, probs, labels):
+            f.write(json.dumps({"idx": example.idx, "prob": float(prob),
+                                "label": int(label)}) + '\n')
 
     return test_metrics
 
@@ -814,6 +844,29 @@ def main():
     parser.add_argument('--server_port', type=str, default='')
 
     # Model architecture
+    parser.add_argument("--pos_weight", type=float, default=1.0,
+                        help="Weight on the positive term of the classification "
+                             "loss. 1.0 = plain BCE (right for a balanced "
+                             "corpus like Devign). On an imbalanced corpus set "
+                             "it near neg/pos, or unweighted BCE collapses to "
+                             "the all-negative solution.")
+    parser.add_argument("--init_from", type=str, default="",
+                        help="Checkpoint to start from, for adapting a model "
+                             "trained elsewhere to a new corpus. Its "
+                             "model_config.json defines the architecture. "
+                             "Ignored when output_dir already has a "
+                             "checkpoint-last, which takes precedence.")
+    parser.add_argument("--freeze_lora", action='store_true',
+                        help="Keep LoRA adapters at their loaded values instead "
+                             "of training them. The control arm for measuring "
+                             "what adapting LoRA to a new domain contributes: "
+                             "same architecture, same checkpoint, adapters "
+                             "simply do not move.")
+    parser.add_argument("--freeze_encoder", action='store_true',
+                        help="In contextual mode, run the encoder but train "
+                             "only the GNN, the heads and any LoRA adapters. "
+                             "Without it, contextual without --use_lora is a "
+                             "full 125M fine-tune.")
     parser.add_argument("--model", default="GNNs", type=str)
     parser.add_argument("--hidden_size", default=256, type=int)
     parser.add_argument("--feature_dim_size", default=768, type=int)
@@ -844,9 +897,12 @@ def main():
                              "as an improvement. Without it, noise in the last "
                              "decimals keeps resetting the patience counter.")
     parser.add_argument("--early_stopping_metric", type=str, default="eval_loss",
-                        choices=["eval_loss", "eval_acc", "eval_auc", "eval_f1"],
+                        choices=["eval_loss", "eval_acc", "eval_auc", "eval_f1",
+                                 "eval_pr_auc"],
                         help="Metric early stopping watches (default: eval_loss, "
-                             "which turns earliest)")
+                             "which turns earliest). On an imbalanced corpus "
+                             "watch eval_pr_auc: eval_acc there rewards the "
+                             "all-negative solution.")
     parser.add_argument("--encoder_mode", type=str, default="auto",
                         choices=["auto", "static", "contextual"],
                         help="How node features are produced. 'static': look "
@@ -919,6 +975,18 @@ def main():
             os.path.join(args.output_dir, 'checkpoint-last'))
         if checkpoint_config:
             apply_model_config(args, checkpoint_config, override=True)
+    elif args.init_from:
+        # A fresh run seeded from a checkpoint produced elsewhere -- domain
+        # adaptation, where the weights come from a model trained on another
+        # corpus and output_dir is empty. The architecture has to come from
+        # that checkpoint too, or the weights land in a model they do not fit.
+        init_config = load_model_config(args.init_from)
+        if init_config:
+            apply_model_config(args, init_config, override=True)
+        else:
+            logger.warning("--init_from %s has no model_config.json; the "
+                           "architecture is being taken from the command line",
+                           args.init_from)
 
     config_class, model_class, tokenizer_class = MODEL_CLASSES[args.model_type]
     config = config_class.from_pretrained(args.config_name if args.config_name else args.model_name_or_path,
@@ -947,6 +1015,16 @@ def main():
 
     if args.local_rank == 0:
         torch.distributed.barrier()
+
+    if args.init_from:
+        if resumed_state:
+            # A resume is the run's own history; --init_from is where the run
+            # began. Letting it win here would silently restart training.
+            logger.info("--init_from ignored: %s already holds a "
+                        "checkpoint-last to resume from", args.output_dir)
+        else:
+            load_checkpoint_weights(args.init_from, model, device, args)
+            logger.info("Initialised weights from %s", args.init_from)
 
     logger.info("Training/evaluation parameters %s", args)
 

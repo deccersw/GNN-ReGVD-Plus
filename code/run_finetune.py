@@ -321,6 +321,23 @@ def main():
                         help="static: frozen embedding lookup (LoRA cannot train); "
                              "contextual: run the encoder so LoRA gets gradient; "
                              "auto: contextual iff --use_lora")
+    parser.add_argument("--pos_weight", type=float, default=1.0,
+                        help="Weight on the positive term of the classification "
+                             "loss. 1.0 = plain BCE (right for a balanced "
+                             "corpus like Devign). On an imbalanced corpus set "
+                             "it near neg/pos, or unweighted BCE collapses to "
+                             "the all-negative solution.")
+    parser.add_argument("--freeze_lora", action='store_true',
+                        help="Keep LoRA adapters at their loaded values instead "
+                             "of training them. The control arm for measuring "
+                             "what adapting LoRA to a new domain contributes: "
+                             "same architecture, same checkpoint, adapters "
+                             "simply do not move.")
+    parser.add_argument("--freeze_encoder", action='store_true',
+                        help="In contextual mode, run the encoder but train "
+                             "only the GNN, the heads and any LoRA adapters. "
+                             "Without it, contextual without --use_lora is a "
+                             "full 125M fine-tune.")
     parser.add_argument("--use_lora", action='store_true')
     parser.add_argument("--lora_rank", type=int, default=8)
     parser.add_argument("--lora_alpha", type=int, default=16)
