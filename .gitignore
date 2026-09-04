@@ -66,3 +66,7 @@ article/*.fls
 article/*.fdb_latexmk
 article/*.synctex.gz
 article/*.toc
+
+# Derived datasets (MegaVul etc.)
+data/
+runs/
