@@ -146,3 +146,52 @@ class TestCLI:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+class TestCheckpointSelection:
+    """Which epoch is kept is a separate decision from when to stop.
+
+    A run can early-stop on eval_pr_auc and still save the epoch with the best
+    eval_acc -- which, on a corpus that is 95% negative, is the epoch closest
+    to predicting "safe" for everything. Both arms of an ablation lose the same
+    way, so a comparison stays fair, but the model that gets tested is not the
+    one the run was judged on.
+    """
+
+    @staticmethod
+    def _select(metric, best, results):
+        """Mirror of the decision made in run.train()."""
+        score = results[metric]
+        return (score < best) if metric == "eval_loss" else (score > best)
+
+    def test_accuracy_can_prefer_a_worse_ranking(self):
+        # Taken from a real pair of epochs: epoch 1 wins on accuracy and loses
+        # on PR-AUC, and it is the one that was saved.
+        first = {"eval_acc": 0.7971, "eval_pr_auc": 0.1607}
+        later = {"eval_acc": 0.7800, "eval_pr_auc": 0.1643}
+        assert not self._select("eval_acc", first["eval_acc"], later)
+        assert self._select("eval_pr_auc", first["eval_pr_auc"], later)
+
+    def test_lower_is_better_only_for_loss(self):
+        assert self._select("eval_loss", 0.60, {"eval_loss": 0.55})
+        assert not self._select("eval_loss", 0.60, {"eval_loss": 0.65})
+        assert self._select("eval_auc", 0.60, {"eval_auc": 0.65})
+        assert not self._select("eval_auc", 0.60, {"eval_auc": 0.55})
+
+    def test_the_flag_offers_every_reported_metric(self):
+        import subprocess, sys, os
+        run_py = os.path.join(os.path.dirname(__file__), "..", "code", "run.py")
+        out = subprocess.run([sys.executable, run_py, "--help"],
+                             capture_output=True, text=True).stdout
+        assert "--best_checkpoint_metric" in out
+        assert "--skip_faiss_index" in out
+        for metric in ("eval_pr_auc", "eval_auc", "eval_f1", "eval_loss"):
+            assert metric in out
+
+    def test_default_keeps_the_previous_behaviour(self):
+        import subprocess, sys, os
+        run_py = os.path.join(os.path.dirname(__file__), "..", "code", "run.py")
+        out = subprocess.run([sys.executable, run_py, "--help"],
+                             capture_output=True, text=True).stdout
+        line = [l for l in out.splitlines() if "best_checkpoint_metric" in l]
+        assert line, "flag missing from --help"

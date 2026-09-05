@@ -362,7 +362,11 @@ def train(args, train_dataset, model, tokenizer):
 
     global_step = args.start_step
     tr_loss, logging_loss, avg_loss, tr_nb, tr_num, train_loss = 0.0, 0.0, 0.0, 0, 0, 0
-    best_acc = 0.0
+    # eval_loss is the one metric where lower is better, so it cannot start
+    # at zero or nothing would ever beat it.
+    best_acc = float('inf') \
+        if getattr(args, 'best_checkpoint_metric', 'eval_acc') == 'eval_loss' \
+        else 0.0
     stop_early = False
     epochs_without_improvement = 0
     best_metric = float('inf') if args.early_stopping_metric == 'eval_loss' else 0.0
@@ -488,10 +492,22 @@ def train(args, train_dataset, model, tokenizer):
                         else:
                             epochs_without_improvement += 1
 
-                        if results['eval_acc'] > best_acc:
-                            best_acc = results['eval_acc']
+                        # Which checkpoint is kept is a separate decision
+                        # from when to stop, and on an imbalanced corpus the
+                        # default answer is a poor one: eval_acc rewards the
+                        # all-negative solution, so a run can early-stop on
+                        # eval_pr_auc and still save the epoch that ranked
+                        # worst. Defaults to eval_acc so existing runs are
+                        # unchanged.
+                        select = getattr(args, 'best_checkpoint_metric',
+                                         'eval_acc')
+                        score = results[select]
+                        better = (score < best_acc) if select == 'eval_loss' \
+                            else (score > best_acc)
+                        if better:
+                            best_acc = score
                             logger.info("  " + "*" * 20)
-                            logger.info("  Best acc:%s", round(best_acc, 4))
+                            logger.info("  Best %s:%s", select, round(best_acc, 4))
                             logger.info("  " + "*" * 20)
 
                             checkpoint_prefix = 'checkpoint-best-acc'
@@ -552,7 +568,7 @@ def train(args, train_dataset, model, tokenizer):
             break
 
     # ── After training: build FAISS index from best model ──
-    if args.use_faiss:
+    if args.use_faiss and not getattr(args, 'skip_faiss_index', False):
         logger.info("Building FAISS index from training data...")
         # Load best checkpoint — FAISS must match the model that will be used at inference
         best_model_path = os.path.join(args.output_dir, 'checkpoint-best-acc', 'model.bin')
@@ -850,6 +866,22 @@ def main():
                              "corpus like Devign). On an imbalanced corpus set "
                              "it near neg/pos, or unweighted BCE collapses to "
                              "the all-negative solution.")
+    parser.add_argument("--best_checkpoint_metric", type=str,
+                        default="eval_acc",
+                        choices=["eval_loss", "eval_acc", "eval_auc",
+                                 "eval_f1", "eval_pr_auc"],
+                        help="Metric that decides which epoch is kept as "
+                             "checkpoint-best-acc. Defaults to eval_acc for "
+                             "backward compatibility; on an imbalanced corpus "
+                             "that saves the epoch closest to predicting "
+                             "'safe' for everything, so set it to the metric "
+                             "the run is actually judged on.")
+    parser.add_argument("--skip_faiss_index", action='store_true',
+                        help="Do not build the FAISS index after training. "
+                             "The index is a post-training artefact and does "
+                             "not affect the weights, so skipping it changes "
+                             "no result -- it only saves the pass over the "
+                             "training set that building it costs.")
     parser.add_argument("--init_from", type=str, default="",
                         help="Checkpoint to start from, for adapting a model "
                              "trained elsewhere to a new corpus. Its "
