@@ -37,6 +37,47 @@ def load(path):
     return [json.loads(line) for line in open(path)]
 
 
+def join_meta(rows, meta_path, block_size=400, tokenizer_name=None):
+    """Attach the fields `run.py` does not record, joining on idx.
+
+    `predictions_prob.jsonl` carries idx, prob and label -- enough for the
+    headline metrics and nothing else. The controls need to know how long each
+    function was and what role it played, which the input file already holds.
+    Joining beats a second scoring pass: the scores are identical either way,
+    and re-running the model over the test set costs half an hour on a GPU
+    while this costs a tokeniser pass on a CPU.
+    """
+    from transformers import RobertaTokenizer
+
+    tok = RobertaTokenizer.from_pretrained(
+        tokenizer_name or "microsoft/graphcodebert-base")
+    window = block_size - 2
+    meta = {}
+    for line in open(meta_path):
+        row = json.loads(line)
+        meta[str(row["idx"])] = row
+
+    missing = 0
+    joined = []
+    for row in rows:
+        extra = meta.get(str(row["idx"]))
+        if extra is None:
+            missing += 1
+            joined.append(row)
+            continue
+        code = extra.get("func", "")
+        n_tokens = len(tok.tokenize(" ".join(code.split())))
+        merged = {k: v for k, v in extra.items() if k != "func"}
+        merged.update(row)
+        merged["n_tokens"] = n_tokens
+        merged["truncated"] = n_tokens > window
+        joined.append(merged)
+    if missing:
+        print(f"warning: {missing} of {len(rows)} rows had no match in "
+              f"{meta_path}; their controls are skipped")
+    return joined
+
+
 def headline(y, p):
     n, pos = len(y), int(y.sum())
     rate = pos / n
@@ -156,9 +197,15 @@ def main():
     parser.add_argument("--threshold", type=float, default=0.5)
     parser.add_argument("--paired", action="store_true",
                         help="also run the before/after ranking check")
+    parser.add_argument("--meta", default=None,
+                        help="input JSONL to join on idx, for reports written "
+                             "by run.py, which records only idx/prob/label")
+    parser.add_argument("--block_size", type=int, default=400)
     args = parser.parse_args()
 
     rows = load(args.predictions)
+    if args.meta:
+        rows = join_meta(rows, args.meta, block_size=args.block_size)
     y = np.array([r["label"] for r in rows])
     p = np.array([r["prob"] for r in rows])
 
