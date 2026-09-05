@@ -596,12 +596,19 @@ class TestSlimCheckpoints:
             load_checkpoint_weights(str(path), make_model())
 
     def test_static_mode_slim_excludes_the_frozen_encoder(self, tmp_path):
+        """None of the pretrained bulk is written.
+
+        LoRA tensors are the exception and are kept: they live under the
+        encoder prefix but are not in the pretrained file, so nothing would
+        restore them on load.
+        """
         from model import save_checkpoint_weights
         model = make_model(encoder_mode="static")
         path = tmp_path / "m.bin"
         save_checkpoint_weights(str(path), model, slim=True)
         payload = torch.load(str(path), weights_only=False)
-        assert not any(n.startswith("encoder.") for n in payload["trainable"])
+        assert not any(n.startswith("encoder.") and "lora_" not in n
+                       for n in payload["trainable"])
 
 
 class TestNoRawCheckpointLoads:
@@ -778,6 +785,7 @@ class TestFreezeLora:
                 if "lora_B" in name:
                     param.fill_(0.05)      # make the adapters do something
         model_off = make_model(encoder_mode="contextual", freeze_lora=True)
+        trained.eval(); model_off.eval()      # dropout would mask the effect
         with torch.no_grad():
             a = trained(ids)[0]
             b = model_off(ids)[0]
@@ -802,3 +810,81 @@ class TestFreezeLora:
         model = make_model(encoder_mode="contextual", use_lora=False,
                            freeze_lora=True)
         assert self._lora_params(model) == []
+
+
+# ----------------------------------------------------------------------
+# Slim checkpoints must survive a reload in a fresh process
+# ----------------------------------------------------------------------
+
+class TestSlimKeepsAdapters:
+    """A frozen adapter is still part of the model.
+
+    The slim format omits what `from_pretrained` restores deterministically.
+    LoRA tensors live under the encoder prefix but are absent from the
+    pretrained file: reloading recreates them with lora_B zeroed, which is an
+    exact no-op. Dropping a frozen adapter therefore does not save space, it
+    changes the model -- and only on the next load, in a different process,
+    long after the run that produced the numbers.
+    """
+
+    @staticmethod
+    def _saved_names(path, model):
+        from model import save_checkpoint_weights
+        save_checkpoint_weights(str(path), model, slim=True)
+        payload = torch.load(str(path), map_location="cpu", weights_only=False)
+        return set(payload["trainable"])
+
+    def test_trainable_adapters_are_stored(self, tmp_path):
+        model = make_model(encoder_mode="contextual")
+        names = self._saved_names(tmp_path / "hot.bin", model)
+        assert [n for n in names if "lora_" in n]
+
+    def test_frozen_adapters_are_stored_too(self, tmp_path):
+        model = make_model(encoder_mode="contextual", freeze_lora=True)
+        names = self._saved_names(tmp_path / "cold.bin", model)
+        lora = [n for n in names if "lora_" in n]
+        assert lora, "a frozen adapter was dropped from the slim checkpoint"
+
+    def test_frozen_and_trainable_store_the_same_tensors(self, tmp_path):
+        """The two ablation arms must round-trip through the same shape."""
+        hot = self._saved_names(tmp_path / "a.bin",
+                                make_model(encoder_mode="contextual"))
+        cold = self._saved_names(tmp_path / "b.bin",
+                                 make_model(encoder_mode="contextual",
+                                            freeze_lora=True))
+        assert hot == cold
+
+    def test_frozen_adapter_values_survive_a_reload(self, tmp_path):
+        """The failure this guards: same input, different answer after reload."""
+        from model import load_checkpoint_weights, save_checkpoint_weights
+
+        trained = make_model(encoder_mode="contextual", freeze_lora=True)
+        with torch.no_grad():
+            for name, param in trained.encoder.named_parameters():
+                if "lora_B" in name:
+                    param.fill_(0.05)          # a non-trivial adapter
+        ids, _ = batch()
+        trained.eval()                        # dropout would mask the effect
+        with torch.no_grad():
+            before = trained(ids)[0].clone()
+
+        path = str(tmp_path / "slim.bin")
+        save_checkpoint_weights(path, trained, slim=True)
+
+        # A fresh model, as a new process would build it: adapters back at
+        # their initialisation, lora_B zeroed.
+        fresh = make_model(encoder_mode="contextual", freeze_lora=True)
+        load_checkpoint_weights(path, fresh, torch.device("cpu"))
+        fresh.eval()
+        with torch.no_grad():
+            after = fresh(ids)[0]
+
+        assert torch.allclose(before, after, atol=1e-6)
+
+    def test_encoder_weights_are_still_omitted(self, tmp_path):
+        """The space saving must survive the fix."""
+        model = make_model(encoder_mode="contextual", freeze_lora=True)
+        names = self._saved_names(tmp_path / "bulk.bin", model)
+        bulk = [n for n in names
+                if n.startswith("encoder.roberta.") and "lora_" not in n]
+        assert bulk == []

@@ -234,9 +234,20 @@ def save_checkpoint_weights(path, model, args=None, slim=True,
     # RobertaForSequenceClassification's task head is randomly initialised on
     # every construction (it is reported MISSING when loading the pretrained
     # weights), so omitting it would silently change the model on reload.
+    # LoRA adapters sit inside the encoder namespace but are not part of the
+    # pretrained file: `from_pretrained` cannot restore them, it recreates them
+    # with lora_B zeroed, which makes them an exact no-op. So the prefix test
+    # alone is not enough -- a frozen adapter passes neither check and would be
+    # dropped, silently turning a fine-tuned model into one without adapters on
+    # the next load. Keep them whether or not they train.
+    def _must_store(name, param):
+        return (param.requires_grad
+                or not name.startswith(pretrained_prefix)
+                or "lora_" in name)
+
     trainable = {}
     for name, param in model_to_save.named_parameters():
-        if param.requires_grad or not name.startswith(pretrained_prefix):
+        if _must_store(name, param):
             trainable[name] = param.detach().cpu()
     # Buffers are tiny and can change during training, so always keep them.
     buffers = {name: buf.detach().cpu()
